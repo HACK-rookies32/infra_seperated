@@ -96,6 +96,12 @@ resource "aws_instance" "web" {
   user_data_base64            = base64gzip(local.web_user_data)
   user_data_replace_on_change = true
 
+  # CloudWatch Agent 가 로그 그룹을 자동 생성하지 않도록, 생성은 로그 그룹 뒤·삭제는 로그 그룹 앞에 오게 한다.
+  depends_on = [
+    aws_cloudwatch_log_group.ec2,
+    aws_iam_role_policy_attachment.cloudwatch_agent_attach,
+  ]
+
   metadata_options {
     http_endpoint               = local.imds_v2.http_endpoint
     http_tokens                 = local.imds_v2.http_tokens
@@ -212,10 +218,13 @@ resource "aws_instance" "was" {
 
   # DB 는 base 에 이미 있다. WAS 부팅 전에 DB 로 가는 SG 경로(인그레스)가 열려
   # 있도록 그 규칙에 의존시킨다(원본의 RDS/Redis depends_on 대체).
+  # 로그 그룹 의존은 web 과 같은 이유(Agent 의 로그 그룹 자동 재생성 방지).
   depends_on = [
     aws_vpc_security_group_ingress_rule.rds_from_was,
     aws_vpc_security_group_ingress_rule.redis_from_was,
     aws_vpc_security_group_ingress_rule.docdb_from_was,
+    aws_cloudwatch_log_group.ec2,
+    aws_iam_role_policy_attachment.cloudwatch_agent_attach,
   ]
 
   metadata_options {
