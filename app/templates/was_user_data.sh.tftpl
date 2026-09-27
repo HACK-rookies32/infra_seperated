@@ -55,7 +55,8 @@ apt_retry() {
 }
 
 apt_retry update
-apt_retry install -y ca-certificates curl gnupg unzip chrony
+apt_retry install -y ca-certificates curl gnupg unzip chrony netcat-traditional
+update-alternatives --set nc /bin/nc.traditional
 
 # ------------------------------------------------------------------
 # 시각 동기화 (chrony + Amazon Time Sync Service) 와 타임존
