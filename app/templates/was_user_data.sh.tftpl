@@ -1,0 +1,646 @@
+#!/bin/bash
+set -uxo pipefail
+exec > /var/log/user-data.log 2>&1
+
+# ==================================================================
+# WAS 부팅 스크립트 (Docker Hub + Watchtower 기반 CI/CD)
+#
+# 배포 시퀀스는 WEB 과 동일하다 (web_user_data.sh.tftpl 참고).
+#   1) backend main 에 push
+#   2) GitHub Actions 가 이미지 빌드 -> Docker Hub 에 :latest 푸시
+#   3) 각 WAS 인스턴스의 Watchtower 가 폴링으로 다이제스트 변경 감지
+#   4) 새 이미지 pull 후 컨테이너 교체
+#
+# 예전 방식(JDK 설치 + S3 에서 jar 다운로드 + systemd java -jar)에서 사라진 것:
+#   - openjdk 설치        -> 이미지의 eclipse-temurin 이 대신한다
+#   - DocumentDB 트러스트스토어 생성 -> backend/Dockerfile 로 옮겼다.
+#                            컨테이너 안의 JDK 를 기준으로 만들어야 하기 때문이다.
+#   - kidhack-fetch.sh    -> Watchtower 가 대신한다
+#   - JAVA_TOOL_OPTIONS   -> 이미지 ENV 로 옮겼다 (트러스트스토어 경로가 이미지 안이므로)
+#
+# ⚠️ IMDS hop limit
+#   compute.tf 에서 2 로 올렸다. WEB 과 달리 WAS 는 앱이 컨테이너 안에서
+#   AWS SDK 를 쓰기 때문이다(S3 업로드/삭제와 presigned URL 발급).
+#   아래 aws CLI 호출은 전부 호스트에서 하므로 이 스크립트 자체는 1 이어도 된다.
+# ==================================================================
+
+export DEBIAN_FRONTEND=noninteractive
+
+# ------------------------------------------------------------------
+# apt 재시도 래퍼
+#
+# 부팅 직후에는 cloud-init 과 unattended-upgrades 가 apt lock 을 잡고 있다.
+# 그 사이에 apt-get 을 부르면 이렇게 실패한다:
+#   E: Could not get lock /var/lib/apt/lists/lock. It is held by process N (python3)
+#   E: Package 'docker-ce' has no installation candidate
+#
+# 이 스크립트는 set -e 가 아니므로(-uxo pipefail 뿐) 실패해도 그냥 진행한다.
+# 그래서 증상이 한참 뒤 "docker: command not found" 로 나타나 원인을 찾기 어렵다.
+# 실제로 4 대 중 1 대에서 이 레이스가 터졌다.
+#
+# DPkg::Lock::Timeout 은 dpkg 프런트엔드 lock 만 커버하고 lists lock 은
+# 커버하지 않으므로, 옵션과 재시도 루프를 함께 쓴다.
+# 끝까지 실패하면 조용히 넘어가지 않고 즉시 중단한다.
+# ------------------------------------------------------------------
+apt_retry() {
+  for attempt in $(seq 1 30); do
+    if apt-get -o DPkg::Lock::Timeout=120 "$@"; then
+      return 0
+    fi
+    echo "apt-get $1 실패 (시도 $attempt/30). 10 초 후 재시도한다."
+    sleep 10
+  done
+  echo "FATAL: apt-get $1 가 30 회 재시도 후에도 실패했다. 부팅을 중단한다."
+  exit 1
+}
+
+apt_retry update
+apt_retry install -y ca-certificates curl gnupg unzip chrony
+
+# ------------------------------------------------------------------
+# 시각 동기화 (chrony + Amazon Time Sync Service) 와 타임존
+#
+# ⚠️ Docker 설치보다 "먼저" 하는 순서가 중요하다.
+#   시계가 어긋나면 TLS 인증서의 유효기간 검증과 AWS SigV4 서명이 함께
+#   깨진다. 증상은 원인에서 멀어 보이는 형태로만 나온다:
+#     docker pull -> x509: certificate has expired or is not yet valid
+#     aws ssm     -> InvalidSignatureException / SignatureDoesNotMatch
+#   토큰이나 IAM 권한을 먼저 의심하게 되는 실패라, 시계부터 맞추고 나머지를
+#   시작한다. 부팅 직후 EC2 시계는 보통 맞지만 항상 그렇지는 않다.
+#
+# 169.254.169.123 : Amazon Time Sync Service.
+#   링크로컬 주소라 NAT 게이트웨이도 인터넷도 타지 않고, 보안그룹/NACL 의
+#   영향도 받지 않는다. 프라이빗 서브넷에 있는 이 인스턴스들이 공개 NTP
+#   풀(ntp.ubuntu.com)에 나갈 필요가 없어진다. minpoll/maxpoll 4(16 초)는
+#   AWS 권장값으로, 로컬 주소라 폴링이 잦아도 비용이 들지 않는다.
+#
+# Ubuntu 22.04 기본은 systemd-timesyncd 인데 SNTP 클라이언트라 보정이 거칠고
+# (한 번에 시각을 점프시킨다) 드리프트 보상을 하지 않는다. chrony 패키지가
+# timesyncd 를 밀어내지만, 둘이 동시에 살아 있으면 서로 시계를 되돌리므로
+# 명시적으로 꺼 둔다.
+# ------------------------------------------------------------------
+systemctl disable --now systemd-timesyncd || true
+
+mkdir -p /etc/chrony/conf.d
+cat > /etc/chrony/conf.d/amazon-time-sync.conf <<'CHRONY'
+server 169.254.169.123 prefer iburst minpoll 4 maxpoll 4
+CHRONY
+
+# 위 파일은 chrony.conf 에 confdir 지시자가 있어야 읽힌다. Ubuntu 22.04 의
+# chrony 패키지 기본 설정에는 들어 있지만, 빠져 있으면 우리 설정이 아무 경고
+# 없이 무시되고 기본 ntp.ubuntu.com 풀만 쓰게 된다. 확인해서 없으면 채운다.
+grep -q '^confdir /etc/chrony/conf.d' /etc/chrony/chrony.conf ||
+  echo 'confdir /etc/chrony/conf.d' >> /etc/chrony/chrony.conf
+
+systemctl enable chrony
+systemctl restart chrony
+
+# 호스트 타임존. /etc/localtime 이 여기서 갈리고, 아래 컨테이너들은 이 파일을
+# 읽기 전용으로 마운트받는다.
+timedatectl set-timezone ${timezone}
+
+# 첫 동기화를 최대 120 초(12 회 x 10 초)까지 기다린다. 실패해도 중단하지는
+# 않는다 — 부팅 시계가 이미 맞는 경우가 대부분이라 여기서 죽이면 득보다
+# 실이 크다. 다만 위에 적은 증상이 나오면 이 로그부터 확인할 것.
+chronyc waitsync 12 0.1 || echo "WARN: NTP 첫 동기화가 120 초 안에 안 끝났다. 계속 진행한다."
+chronyc tracking
+timedatectl status
+
+# ------------------------------------------------------------------
+# Docker (공식 저장소) — 버전 고정: ${docker_version}
+# Ubuntu 기본 저장소의 docker.io 는 버전이 낡아 공식 저장소를 쓴다.
+# CVE-2026-34040 실습이 특정 데몬 API 세대(29.3.x)를 전제하므로 latest 대신 고정한다.
+# ------------------------------------------------------------------
+install -m 0755 -d /etc/apt/keyrings
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg |
+  gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+chmod a+r /etc/apt/keyrings/docker.gpg
+
+echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.gpg] \
+https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo $VERSION_CODENAME) stable" \
+  > /etc/apt/sources.list.d/docker.list
+
+apt_retry update
+
+# madison 출력: "docker-ce | 5:29.3.0-1~ubuntu.22.04~jammy | <repo>" — 세 번째 필드가
+# apt 에 넣을 정확한 버전 문자열이다. 버전 경계를 위해 앞뒤 구분자([:~-]/[-~])까지 매칭.
+DOCKER_PKG_VERSION="$(apt-cache madison docker-ce \
+  | awk -v v="${docker_version}" '$3 ~ ("[:~-]" v "[-~]") {print $3; exit}')"
+if [ -z "$DOCKER_PKG_VERSION" ]; then
+  echo "FATAL: docker-ce ${docker_version} 를 apt 레포에서 찾지 못했다. 사용 가능한 버전:"
+  apt-cache madison docker-ce | awk '{print $3}'
+  exit 1
+fi
+echo "pinning docker-ce/docker-ce-cli to $DOCKER_PKG_VERSION"
+apt_retry install -y \
+  docker-ce="$DOCKER_PKG_VERSION" \
+  docker-ce-cli="$DOCKER_PKG_VERSION" \
+  containerd.io
+# unattended-upgrades 가 핀을 되돌리지 않게 hold.
+apt-mark hold docker-ce docker-ce-cli
+
+# ------------------------------------------------------------------
+# 컨테이너 로그 로테이션
+#
+# Docker 기본 json-file 드라이버는 크기 제한이 없다. Spring Boot 는 로그를
+# stdout 으로 내보내고 application.yml 의 show-sql: true 때문에 쿼리까지
+# 전부 찍히므로, 두면 30GB 루트 볼륨이 WEB 보다 빨리 찬다.
+# WATCHTOWER_CLEANUP 은 옛 "이미지" 만 지우지 로그는 건드리지 않는다.
+# ------------------------------------------------------------------
+mkdir -p /etc/docker
+cat > /etc/docker/daemon.json <<'DAEMON'
+{
+  "log-driver": "json-file",
+  "log-opts": {
+    "max-size": "10m",
+    "max-file": "3"
+  }
+}
+DAEMON
+
+systemctl enable docker
+systemctl restart docker
+
+%{ if authz_enabled ~}
+# ==================================================================
+# [모의해킹 실습] Docker AuthZ 플러그인 (OPA) — enable_docker_authz_lab=true 일 때만 렌더링
+# 데몬 API 에 닿는 통로는 소켓 마운트다(= 사실상 root). 이 랩에서는 Watchtower 뿐 아니라
+# 앱 컨테이너(kidhack)에도 /var/run/docker.sock 을 일부러 물린다(authz_enabled 일 때만).
+# 8080 으로 외부에 노출된 앱을 통해 소켓에 닿는 경로를 의도적으로 열어 공격면을 만들고,
+# 그 API 호출을 아래 AuthZ 플러그인이 Rego 정책으로 allow/deny 해 privileged/호스트 루트
+# 바인드 같은 '호스트 장악' 경로만 기본 거부로 막는다(우회는 CVE-2026-34040 패딩뿐).
+#
+# ⚠️ 순서(락아웃 방지): install/enable → "확실히 enabled 일 때만" daemon.json 배선 → restart.
+#    반영 후 데몬 비정상이면(정책 미로딩 등) daemon.json 을 자동 롤백한다.
+# ⚠️ 정책 경로/마운트는 플러그인 버전마다 다를 수 있다. 기본 마운트가 /etc/docker/authz 를
+#    못 집으면 `docker plugin set ${opa_authz_plugin} ...` 로 맞출 것(팀 몫. variables.tf 참고).
+# ==================================================================
+mkdir -p /etc/docker/authz
+
+# 베이스라인 정책: 기본 거부(default deny) + Watchtower CI/CD 수명주기만 allow.
+# fleet 안전(부팅 시 docker login·앱/Watchtower 컨테이너 생성·docker info)을 깨지 않으면서,
+# privileged/호스트 루트 바인드 같은 "소켓으로 호스트 장악" 경로만 기본 거부로 남긴다.
+#
+# ⚠️ CVE-2026-34040 데모의 축: 아래 '컨테이너 생성' allow 는 요청 "본문"(Privileged/루트
+#    바인드)을 보고 안전 여부를 판정한다. Docker 29.3.0 은 1MB 초과 본문을 플러그인에
+#    닿기 전에 버리므로, 패딩한 생성 요청은 플러그인 눈에 '본문 없는(=안전한) 생성'으로
+#    보여 이 allow 를 통과하고 데몬은 실제 본문대로 privileged 컨테이너를 만든다(=우회).
+#    경로만으로 create 를 열면 평상시에도 안 막혀 우회할 대상 자체가 없어진다.
+# ⚠️ 부팅 락아웃 주의: 이 정책이 켜진 뒤 스크립트가 이어서 하는 docker login(POST /auth),
+#    앱/Watchtower 컨테이너 생성(POST /containers/create), docker info(GET) 가 전부 아래
+#    allow 에 걸려야 부팅이 진행된다. GET /info 가 막히면 헬스체크 실패로 daemon.json 이
+#    자동 롤백된다(=AuthZ 해제). 아래 규칙은 이 세 가지를 모두 통과시킨다.
+# ⚠️ input.Method/Path/Body 스키마·경로는 플러그인 버전(${opa_authz_plugin})에 맞춰 팀이
+#    검증할 것. 어긋나면 규칙이 조용히 안 걸려(대개 fail-open) 통제가 무력화된다.
+cat > /etc/docker/authz/authz.rego <<'REGO'
+package docker.authz
+
+default allow = false
+
+# 상태 조회/검사/로그, 헬스체크(docker info·version·_ping), Watchtower 폴링 — 전부 GET.
+allow {
+  input.Method == "GET"
+}
+
+# 레지스트리 로그인 (private 이미지 pull 전제)
+allow {
+  input.Method == "POST"
+  contains(input.Path, "/auth")
+}
+
+# 이미지 pull (Watchtower 갱신)
+allow {
+  input.Method == "POST"
+  contains(input.Path, "/images/create")
+}
+
+# 이미지 정리 (WATCHTOWER_CLEANUP=true)
+allow {
+  input.Method == "DELETE"
+  contains(input.Path, "/images/")
+}
+
+# 기존 컨테이너 수명주기: 교체 시 stop→rename→start, watchdog 재기동, 제거 등.
+# id 로 지정된 '이미 존재하는' 컨테이너 대상 동작만. (exec 은 의도적으로 미포함=거부)
+allow {
+  input.Method == "POST"
+  regex.match(`/containers/[^/]+/(start|stop|restart|kill|wait|rename)`, input.Path)
+}
+allow {
+  input.Method == "DELETE"
+  contains(input.Path, "/containers/")
+}
+
+# 컨테이너 '생성' — 여기가 CVE-2026-34040 우회 지점이다(의도적으로 열어 둔다).
+#
+# 구조: "위험 패턴이 하나도 없으면 허용"(denylist). 정상 컨테이너가 절대 안 쓰는
+# 호스트 장악용 필드를 dangerous_create 로 열거하고, 바인드/마운트 소스는 이 fleet 이
+# 실제로 쓰는 경로만 allowed_source 허용목록으로 둔다. 목록 밖이면 위험 → 기본 거부.
+# (예전엔 privileged 와 '/:' 루트 바인드 두 가지만 봐서 나머지 escalation 경로 — 추가
+#  capability·호스트 네임스페이스·devices·임의 호스트 경로 바인드 — 가 전부 무방비였다.
+#  이제 진짜 본문을 보내는 평범한 남용은 아래 열거·허용목록이 다 잡는다.)
+#
+# ⚠️ CVE 시연 포인트(이 랩의 목적): 이 규칙은 본문을 '보고' 판정한다. 본문이 비어 있으면
+#    (Docker 29.3.0 이 1MB 초과 본문을 플러그인에 닿기 전에 버려 플러그인 눈엔 빈 본문)
+#    dangerous_create 의 어느 절도 참조 필드가 없어 걸리지 않는다 → not dangerous_create=true
+#    → 통과. 데몬은 그 뒤 실제(패딩된) 본문대로 privileged 컨테이너를 만든다 = 우회.
+#    이 통과를 '유일한 우회로'로 남기는 게 시연 목적이다. 닫으려면 이 allow 에 positive 게이트
+#    (예: known_image — 알려진 이미지일 때만 통과)를 한 줄 얹으면 빈 본문이 Image 부재로 탈락한다.
+allow {
+  input.Method == "POST"
+  contains(input.Path, "/containers/create")
+  not dangerous_create
+}
+
+# 정상 컨테이너가 안 쓰는 구조 필드 = 있으면 무조건 위험.
+# (필드 부재 시 count/비교가 undefined 라 절이 안 걸린다 = 정상 컨테이너는 통과.)
+dangerous_create { input.Body.HostConfig.Privileged == true }
+dangerous_create { input.Body.HostConfig.CapAdd[_] }
+dangerous_create { input.Body.HostConfig.PidMode     == "host" }
+dangerous_create { input.Body.HostConfig.NetworkMode == "host" }
+dangerous_create { input.Body.HostConfig.IpcMode     == "host" }
+dangerous_create { startswith(input.Body.HostConfig.UsernsMode, "host") }
+dangerous_create { input.Body.HostConfig.Devices[_] }
+dangerous_create { input.Body.HostConfig.SecurityOpt[_] }
+
+# 바인드/마운트: 이 fleet 이 실제로 쓰는 소스만 허용, 그 밖이면 위험.
+#   /opt/app/...          앱 firebase.json 등
+#   /etc/localtime        타임존
+#   /var/run/docker.sock  Watchtower + (랩) 앱 컨테이너
+#   /root/.docker         Watchtower 레지스트리 자격
+dangerous_create {
+  some b
+  not allowed_source(input.Body.HostConfig.Binds[b])
+}
+dangerous_create {
+  some m
+  mnt := input.Body.HostConfig.Mounts[m]
+  mnt.Type == "bind"
+  not allowed_source(mnt.Source)
+}
+
+allowed_source(src) {
+  prefixes := ["/opt/app/", "/etc/localtime", "/var/run/docker.sock", "/root/.docker"]
+  startswith(src, prefixes[_])
+}
+REGO
+
+# 관리형 플러그인 install(비대화식 부팅이라 권한 자동 승인). 정책 파일을 가리키게 한다.
+docker plugin install ${opa_authz_plugin} \
+  opa-args="-policy-file /opa/authz.rego" \
+  --grant-all-permissions \
+  || echo "WARN: AuthZ 플러그인 install 실패. daemon.json 은 그대로 둔다."
+
+# 플러그인이 "확실히 enabled" 일 때만 데몬에 물린다. 아니면 손대지 않아 락아웃을 피한다.
+if docker plugin inspect ${opa_authz_plugin} --format '{{.Enabled}}' 2>/dev/null | grep -qx true; then
+  cat > /etc/docker/daemon.json <<DAEMON
+{
+  "log-driver": "json-file",
+  "log-opts": {
+    "max-size": "10m",
+    "max-file": "3"
+  },
+  "authorization-plugins": ["${opa_authz_plugin}"]
+}
+DAEMON
+  systemctl restart docker
+  sleep 3
+  # 반영 직후 데몬이 응답하지 않으면(정책 미로딩 등으로 authz 가 전부 deny) 롤백한다.
+  if ! docker info >/dev/null 2>&1; then
+    echo "FATAL(복구): AuthZ 반영 후 데몬 비정상 → daemon.json 롤백."
+    cat > /etc/docker/daemon.json <<'DAEMON'
+{
+  "log-driver": "json-file",
+  "log-opts": {
+    "max-size": "10m",
+    "max-file": "3"
+  }
+}
+DAEMON
+    systemctl restart docker
+  else
+    echo "AuthZ: ${opa_authz_plugin} 데몬에 반영 완료."
+  fi
+else
+  echo "WARN: AuthZ 플러그인이 enabled 가 아니다 → daemon.json 유지(락아웃 회피). user-data.log 확인."
+fi
+%{ endif ~}
+
+# ------------------------------------------------------------------
+# AWS CLI v2 (SSM 에서 비밀 값을 읽는 용도)
+# Ubuntu apt 의 awscli 는 v1 이라 낡았다.
+# ------------------------------------------------------------------
+curl -sS "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
+unzip -q /tmp/awscliv2.zip -d /tmp
+/tmp/aws/install
+rm -rf /tmp/aws /tmp/awscliv2.zip
+
+mkdir -p /opt/app
+
+# ------------------------------------------------------------------
+# 비밀 값은 user_data 에 넣지 않는다. user_data 는 인스턴스 메타데이터로
+# 노출되어 인스턴스 내 아무 프로세스나 평문으로 읽을 수 있기 때문에,
+# 부팅 시 SSM Parameter Store 에서 복호화해 가져온다.
+# ------------------------------------------------------------------
+DB_PASSWORD=$(aws ssm get-parameter --name "${db_password_param}" --with-decryption \
+  --region ${region} --query Parameter.Value --output text)
+DOCDB_PASSWORD=$(aws ssm get-parameter --name "${docdb_password_param}" --with-decryption \
+  --region ${region} --query Parameter.Value --output text)
+JWT_SECRET=$(aws ssm get-parameter --name "${jwt_secret_param}" --with-decryption \
+  --region ${region} --query Parameter.Value --output text)
+# 카드 저장 필드암호화 키(Base64 32B). 이미지에 굽지 않고 여기서 받아 app.env 로 넘긴다.
+CARD_STORAGE_KEY=$(aws ssm get-parameter --name "${card_storage_key_param}" --with-decryption \
+  --region ${region} --query Parameter.Value --output text)
+
+# ------------------------------------------------------------------
+# Docker Hub 로그인
+#
+# 대상 저장소가 private 이므로 로그인은 선택이 아니라 필수다.
+# 실패하면 아래 컨테이너가 이미지를 못 받아 30 초마다 재시도만 하게 된다.
+#
+# docker login 은 config.json 을 새로 써서 교체한다(아이노드가 바뀐다).
+# 따라서 watchtower 에는 파일이 아니라 디렉터리를 마운트해야 한다.
+#
+# WAS 는 WEB 과 다른 Docker Hub 계정을 쓴다(개인 계정 2 개, org 아님).
+# 레지스트리당 로그인은 한 계정뿐이지만 WEB 과 WAS 는 서로 다른 EC2 라
+# 충돌하지 않는다. 각자 자기 계정으로 로그인하고 자기 이미지만 받는다.
+# 여기로 넘어오는 사용자명/토큰은 compute.tf 에서 was_* 변수로 배선된다.
+# ------------------------------------------------------------------
+mkdir -p /root/.docker
+
+DOCKERHUB_TOKEN=$(aws ssm get-parameter --name "${dockerhub_token_param}" --with-decryption \
+  --region ${region} --query Parameter.Value --output text)
+
+if [ -z "$DOCKERHUB_TOKEN" ] || [ "$DOCKERHUB_TOKEN" = "None" ]; then
+  echo "FATAL: Docker Hub 토큰이 비어 있다. private 저장소라 pull 이 불가능하다."
+else
+  echo "$DOCKERHUB_TOKEN" | docker login --username "${dockerhub_username}" --password-stdin \
+    || echo "FATAL: docker login 실패. 토큰 값과 권한(Read)을 확인할 것."
+fi
+
+# ------------------------------------------------------------------
+# Firebase 서비스 계정 키
+#
+# 이미지에 굽지 않고 SSM 에서 받아 파일로 떨군 뒤 읽기 전용 마운트한다.
+# 값이 기본 자리표시자("{}")면 FirebaseConfig 가 IOException 을 잡아
+# warn 만 남기고 앱은 정상 기동한다(푸시 알림만 비활성).
+#
+# 컨테이너가 uid 10001 로 돌기 때문에 소유자를 맞춘다.
+# ------------------------------------------------------------------
+aws ssm get-parameter --name "${firebase_key_param}" --with-decryption \
+  --region ${region} --query Parameter.Value --output text > /opt/app/firebase.json
+chmod 600 /opt/app/firebase.json
+chown 10001:0 /opt/app/firebase.json
+
+# ------------------------------------------------------------------
+# 업로드 디렉터리는 더 이상 만들지 않는다 (S3 전환 완료).
+#
+# 예전에는 /opt/app/uploads 를 호스트에 만들어 컨테이너의 /app/uploads 에
+# 마운트했다. 앱이 상대경로 uploads/community 에 썼기 때문에 이 마운트가 없으면
+# Watchtower 가 컨테이너를 교체할 때마다 업로드 파일이 사라졌다.
+# 다만 WAS 가 2 대라 WAS1 에 올린 파일을 WAS2 가 서빙하지 못하는 문제는
+# 그 방식으로 풀리지 않는 임시 방편이었다.
+#
+# 이제 아래 APP_S3_BUCKET 이 채워져 있으면 앱이 S3 에만 쓰므로 이 경로를 아무도
+# 읽지 않는다. 빈 디렉터리를 남겨 두는 것이 오히려 위험하다 — 버킷 이름에 오타가
+# 나거나 값이 비면 앱이 에러 없이 조용히 로컬 디스크 모드로 떨어지고, 그때
+# 마운트가 있으면 "WAS1 에 올린 파일이 WAS2 에서 404" 라는 산발적 증상으로만
+# 드러난다. 마운트가 없으면 재배포 때 바로 티가 난다.
+# ------------------------------------------------------------------
+
+# ------------------------------------------------------------------
+# 앱 환경변수
+#
+# ⚠️ 예전에는 이 파일이 운영 설정 전부(Oracle URL, Redis 호스트, S3 버킷 ...)를
+#    들고 있었다. 지금은 그 대부분이 이미지 안의 application-prod.yml 로 갔다.
+#    그 파일은 backend 레포에도 없고 GitHub Secrets 의 APPLICATION_PROD_YML 에
+#    있으며, CD 가 빌드 직전에 복원해 jar 에 넣는다.
+#    아래 SPRING_PROFILES_ACTIVE=prod 가 그 프로파일을 켠다.
+#
+# 여기 남은 것은 "이미지에 구우면 안 되는 값" 뿐이다.
+# 비밀번호를 이미지에 넣으면 CD 가 남기는 sha- 롤백 태그 안에 옛 비밀번호가
+# 영구히 남고, Docker Hub 이미지를 pull 할 수 있는 사람 = DB 에 붙을 수 있는
+# 사람이 된다. 반대로 엔드포인트/계정명은 프라이빗 서브넷이라 새어도 붙지 못한다.
+#
+# ⚠️ 환경변수가 yml 보다 우선순위가 높다. 여기에 SPRING_DATASOURCE_URL 같은
+#    줄을 다시 넣으면 시크릿의 yml 이 아무 에러 없이 무시된다.
+#    비밀이 아닌 값을 바꿀 일이 생기면 backend 레포의 시크릿을 고칠 것.
+#
+# ⚠️ 이 파일은 systemd EnvironmentFile 이 아니라 docker --env-file 로 읽힌다.
+#    Docker 는 따옴표를 벗기지 않고 값의 일부로 취급하므로, 값에 따옴표를
+#    넣지 말 것. 변수 확장도 하지 않으므로 아래 & 나 $ 는 안전하다.
+# ------------------------------------------------------------------
+cat > /opt/app/app.env <<EOF
+# 비밀이 아닌데도 여기 남는 유일한 값. 아래 docker run 의 -p 8080:8080 과
+# 짝이라 인프라 쪽에서 함께 관리하는 편이 맞다.
+SERVER_PORT=8080
+
+# 이미지 안의 application-prod.yml 을 켠다.
+# 이 줄이 없으면 앱이 기본 프로파일로 떠서 H2 인메모리 + localhost Mongo/Redis
+# 로 동작한다. 그것도 "기동 성공" 이라 아무 에러가 없고, 재배포 때 데이터가
+# 통째로 사라지는 형태로만 뒤늦게 드러난다.
+SPRING_PROFILES_ACTIVE=prod
+
+# --- RDS Oracle 비밀번호 ---
+# 나머지 접속 정보(엔드포인트/계정명/드라이버/다이얼렉트)는 prod yml 에 있다.
+SPRING_DATASOURCE_PASSWORD=$DB_PASSWORD
+
+# --- 스키마 최초 생성 (평소에는 주석 처리된 상태로 둔다) ---
+# prod yml 은 ddl-auto: validate 라 테이블이 없으면 기동에 실패한다.
+# 빈 DB 에 처음 배포할 때만 아래 줄의 주석을 풀어 띄우고, 테이블이 만들어진
+# 것을 확인한 뒤 다시 주석 처리해서 재기동할 것.
+# 켜 둔 채로 두면 운영 스키마에 자동 DDL 이 계속 나간다.
+#SPRING_JPA_HIBERNATE_DDL_AUTO=update
+
+# --- DocumentDB ---
+# URI 문자열 안에 비밀번호가 박히는 구조라 통째로 여기 남는다.
+# replicaSet=rs0  : DocumentDB 의 레플리카셋 이름은 항상 rs0 고정.
+#                   이걸 붙이면 드라이버가 토폴로지를 발견해 쓰기는 Writer,
+#                   읽기는 readPreference 대로 라우팅한다(페일오버 자동 추종).
+# retryWrites=false : DocumentDB 는 재시도 가능 쓰기를 지원하지 않는데
+#                     Java 드라이버는 기본으로 켜므로 반드시 꺼야 한다.
+SPRING_DATA_MONGODB_URI=mongodb://${docdb_username}:$DOCDB_PASSWORD@${docdb_endpoint}:27017/kidhack_chat?tls=true&replicaSet=rs0&readPreference=secondaryPreferred&retryWrites=false
+
+# --- JWT ---
+# prod yml 의 jwt.secret 이 이 환경변수를 플레이스홀더로 참조한다.
+# 값이 없으면 플레이스홀더 해석에 실패해 앱이 아예 뜨지 않는다 —
+# 공개된 로컬 테스트 키로 토큰을 서명하는 것보다 이쪽이 낫다.
+JWT_SECRET=$JWT_SECRET
+
+# --- 카드 저장 필드암호화 키 ---
+# prod yml 의 kidhack.card.storage-key 가 이 값을 플레이스홀더로 참조한다.
+# 비면 FieldEncryptionKey 가 재기동마다 난수 키를 만들어 WAS 2 대가 서로 다른 키를
+# 들게 되고, 그러면 GET /wallet/cards 가 간헐 500 이 나며 재배포 때 옛 카드가 복호
+# 불가가 된다. 그래서 이미지에 굽는 대신 SSM 에서 받아 여기로 넘긴다.
+CARD_STORAGE_KEY=$CARD_STORAGE_KEY
+
+# --- AWS SDK ---
+# S3 버킷 이름(app.s3.bucket)은 prod yml 로 갔다. 버킷을 바꾸려면
+# storage.tf 의 var.s3_bucket_name 과 backend 레포의 시크릿을 함께 고칠 것.
+# 한쪽만 바꾸면 앱이 에러 없이 조용히 엉뚱한/없는 버킷을 보게 된다.
+#
+# 리전은 SDK 표준 환경변수라 여기 남긴다. 없으면 SDK 가 IMDS 로 리전을
+# 조회하는데(컨테이너 안이라 hop 2 가 필요하고 이미 그렇게 설정되어 있지만)
+# 왕복이 한 번 줄고 동작이 명시적이 된다.
+AWS_REGION=${region}
+EOF
+
+chmod 600 /opt/app/app.env
+
+# ------------------------------------------------------------------
+# WAS 컨테이너
+#
+# 이미지가 아직 Docker Hub 에 없어도(최초 apply 가 CI 보다 먼저인 경우) 죽지
+# 않고 30 초마다 재시도한다. WEB 과 같은 방식이다.
+# 즉 인프라를 먼저 올려두고 나중에 파이프라인을 돌려도 알아서 붙는다.
+#
+# 트러스트스토어 경로(JAVA_TOOL_OPTIONS)는 이미지가 스스로 들고 있으므로
+# 여기서 넘기지 않는다. backend/Dockerfile 참고.
+#
+# watchtower 라벨이 붙은 컨테이너만 갱신 대상이 된다.
+# ------------------------------------------------------------------
+# ⚠️ 컨테이너 시각과 타임존
+# 컨테이너는 호스트 커널의 시계를 그대로 공유한다. 즉 "시각" 자체는 위의
+# chrony 로 이미 맞춰져 있고, 컨테이너 안에서 따로 NTP 를 돌릴 필요도 없다
+# (애초에 컨테이너에는 시계를 바꿀 권한이 없다).
+# 어긋나는 것은 타임존뿐이다. 이미지 안의 기본값은 UTC 라, 손대지 않으면
+# 호스트 journalctl 은 KST 인데 앱 로그만 9 시간 뒤로 찍힌다.
+#
+# WEB 보다 파장이 크다. JVM 의 기본 타임존이 곧 LocalDateTime.now() 와
+# Timestamp 변환의 기준이라, 게시글 작성 시각이나 알림 예약 시각처럼
+# DB 에 들어가는 값까지 함께 밀린다. 로그만 이상한 게 아니라 데이터가
+# 이상해지는 쪽이라 나중에 되돌리기도 어렵다.
+#
+#   TZ             : JVM 이 기본 타임존을 정할 때 읽는 값. Java 는 자체 tzdb
+#                    (JAVA_HOME/lib/tzdb.dat)를 들고 있어 이 이름만으로 해석된다.
+#   /etc/localtime : 이미지 안의 다른 도구(로그 수집 등)를 위한 보험.
+#                    호스트가 timedatectl 로 이미 갈아 둔 그 파일이다.
+# 둘 다 이미지를 바꾸지 않으므로 Watchtower 의 컨테이너 교체와 무관하다.
+#
+# ⚠️ RestartSec 을 짧게 두지 말 것.
+# 이미지가 아직 Docker Hub 에 없으면 docker run 이 매번 pull 을 시도하고,
+# 그 하나하나가 레지스트리 인증 요청이 된다. 30 초로 뒀을 때 4 대 합쳐
+# 분당 8 회를 두드렸고, 토큰을 교체하는 순간 그게 전부 "실패한 로그인" 으로
+# 집계되어 Docker Hub 가 계정을 차단했다:
+#   toomanyrequests: too many failed login attempts for username or IP address
+# 300 초면 분당 0.8 회로 떨어진다. 이미지가 올라오면 첫 시도에 성공하므로
+# 이 간격은 "아직 배포 전" 구간에서만 의미가 있다.
+cat > /etc/systemd/system/kidhack.service <<UNIT
+[Unit]
+Description=kidhack backend (Spring Boot)
+After=docker.service network-online.target
+Requires=docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStartPre=-/usr/bin/docker rm -f kidhack
+ExecStart=/usr/bin/docker run -d \\
+  --name kidhack \\
+  --restart unless-stopped \\
+  -p 8080:8080 \\
+  --env-file /opt/app/app.env \\
+  -v /opt/app/firebase.json:/run/secrets/firebase.json:ro \\
+  -e TZ=${timezone} \\
+  -v /etc/localtime:/etc/localtime:ro \\
+%{ if authz_enabled ~}
+  -v /var/run/docker.sock:/var/run/docker.sock \\
+%{ endif ~}
+  -l com.centurylinklabs.watchtower.enable=true \\
+  ${was_image}:latest
+Restart=on-failure
+RestartSec=300
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+systemctl daemon-reload
+systemctl enable kidhack
+systemctl start kidhack || echo "WARN: 이미지 없음. 30 초마다 재시도한다."
+
+# ------------------------------------------------------------------
+# Watchtower
+#
+# 설정 근거는 web_user_data.sh.tftpl 의 같은 블록 주석과 동일하다.
+#
+# 시작 지연(stagger):
+#   WAS 2 대가 동시에 컨테이너를 교체하면 그 사이 NLB 에 살아 있는 타깃이
+#   0 이 되어 /api 전체가 502 가 된다. WEB 보다 창이 길다 — nginx 는 1 초면
+#   뜨지만 Spring Boot 는 기동에 20~40 초가 걸리기 때문이다.
+#   호스트명 해시로 0~119 초를 흩어 두 인스턴스의 폴링 주기를 어긋나게 한다.
+# ------------------------------------------------------------------
+STAGGER=$(( $(hostname | cksum | cut -d' ' -f1) % 120 ))
+echo "watchtower stagger: $STAGGER seconds"
+sleep "$STAGGER"
+
+docker run -d \
+  --name watchtower \
+  --restart unless-stopped \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  -v /root/.docker:/config \
+  -e DOCKER_CONFIG=/config \
+  -e WATCHTOWER_POLL_INTERVAL=${watchtower_poll_interval} \
+  -e WATCHTOWER_CLEANUP=true \
+  -e WATCHTOWER_LABEL_ENABLE=true \
+  -e TZ=${timezone} \
+  ${watchtower_image}
+
+# ------------------------------------------------------------------
+# kidhack 컨테이너 감시(watchdog)
+#
+# 왜 필요한가:
+#   kidhack.service 는 Type=oneshot + RemainAfterExit=yes 라, "docker run 명령"
+#   이 성공하면 systemd 는 그 뒤 컨테이너의 생사를 더 이상 보지 않는다.
+#   실제로 한 번, watchtower 가 이미지를 교체한 뒤 컨테이너가 통째로 사라졌는데도
+#   systemd 는 active(exited) 로 정상이라 믿고 아무것도 하지 않아, WAS 한 대가
+#   며칠간 죽어 있었다. --restart unless-stopped 는 "컨테이너가 존재할 때" 만
+#   유효하므로 이 경우(컨테이너 자체가 없음)를 못 잡는다.
+#
+# 무엇을 하는가:
+#   1 분마다 kidhack 컨테이너의 "존재 여부" 만 본다. 없으면 유닛을 재기동한다.
+#   존재하는데 재시작 루프를 도는 경우(=이미지가 깨진 경우)는 일부러 건드리지
+#   않는다 — 그건 watchdog 이 가려 버리면 안 되는 별개의 배포 실패 신호이고,
+#   --restart 정책이 이미 재시도하고 있다.
+#
+#   "not running" 이 아니라 "not exists" 를 기준으로 삼는 이유는 watchtower 의
+#   교체 창(stop→start, 수 초)과 부딪혀 정상 배포를 방해하지 않기 위해서다.
+# ------------------------------------------------------------------
+cat > /usr/local/bin/kidhack-watchdog.sh <<'SH'
+#!/bin/bash
+# kidhack 컨테이너가 아예 없을 때만 유닛을 다시 돌린다.
+if ! docker inspect kidhack >/dev/null 2>&1; then
+  echo "$(date -Is) kidhack 컨테이너 없음 → systemctl restart kidhack"
+  systemctl restart kidhack
+fi
+SH
+chmod +x /usr/local/bin/kidhack-watchdog.sh
+
+cat > /etc/systemd/system/kidhack-watchdog.service <<'UNIT'
+[Unit]
+Description=kidhack container watchdog
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/kidhack-watchdog.sh
+UNIT
+
+cat > /etc/systemd/system/kidhack-watchdog.timer <<'UNIT'
+[Unit]
+Description=Run kidhack watchdog every minute
+
+[Timer]
+# 부팅 직후에는 kidhack.service 가 아직 이미지를 받는 중일 수 있어 5 분 뒤 시작.
+OnBootSec=5min
+OnUnitActiveSec=1min
+AccuracySec=10s
+
+[Install]
+WantedBy=timers.target
+UNIT
+
+systemctl daemon-reload
+systemctl enable --now kidhack-watchdog.timer
