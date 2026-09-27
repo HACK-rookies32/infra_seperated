@@ -37,3 +37,5 @@ terraform.rc
 # backend 레포도 같은 이름을 막고 있다.
 firebase-service-account.json
 *-firebase-adminsdk-*.json
+
+*.txt

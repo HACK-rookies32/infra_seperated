@@ -174,7 +174,6 @@ systemctl restart docker
 # ⚠️ 정책 경로/마운트는 플러그인 버전마다 다를 수 있다. 기본 마운트가 /etc/docker/authz 를
 #    못 집으면 `docker plugin set ${opa_authz_plugin} ...` 로 맞출 것(팀 몫. variables.tf 참고).
 # ==================================================================
-mkdir -p /etc/docker/authz
 
 # 베이스라인 정책: 기본 거부(default deny) + Watchtower CI/CD 수명주기만 allow.
 # fleet 안전(부팅 시 docker login·앱/Watchtower 컨테이너 생성·docker info)을 깨지 않으면서,
@@ -191,63 +190,71 @@ mkdir -p /etc/docker/authz
 #    자동 롤백된다(=AuthZ 해제). 아래 규칙은 이 세 가지를 모두 통과시킨다.
 # ⚠️ input.Method/Path/Body 스키마·경로는 플러그인 버전(${opa_authz_plugin})에 맞춰 팀이
 #    검증할 것. 어긋나면 규칙이 조용히 안 걸려(대개 fail-open) 통제가 무력화된다.
-cat > /etc/docker/authz/authz.rego <<'REGO'
+cat > /etc/docker/authz.rego <<'REGO'
 package docker.authz
 
-default allow = false
+import rego.v1
 
-# 상태 조회/검사/로그, 헬스체크(docker info·version·_ping), Watchtower 폴링 — 전부 GET.
-allow {
-  input.Method == "GET"
+default allow := false
+
+allow if {
+	input.Method == "GET"
 }
 
-# 레지스트리 로그인 (private 이미지 pull 전제)
-allow {
-  input.Method == "POST"
-  contains(input.Path, "/auth")
+allow if {
+	input.Method == "POST"
+	contains(input.Path, "/auth")
 }
 
-# 이미지 pull (Watchtower 갱신)
-allow {
-  input.Method == "POST"
-  contains(input.Path, "/images/create")
+allow if {
+	input.Method == "POST"
+	contains(input.Path, "/images/create")
 }
 
-# 이미지 정리 (WATCHTOWER_CLEANUP=true)
-allow {
-  input.Method == "DELETE"
-  contains(input.Path, "/images/")
+allow if {
+	input.Method == "DELETE"
+	contains(input.Path, "/images/")
 }
 
-# 기존 컨테이너 수명주기: 교체 시 stop→rename→start, watchdog 재기동, 제거 등.
-# id 로 지정된 '이미 존재하는' 컨테이너 대상 동작만. (exec 은 의도적으로 미포함=거부)
-allow {
-  input.Method == "POST"
-  regex.match(`/containers/[^/]+/(start|stop|restart|kill|wait|rename)`, input.Path)
-}
-allow {
-  input.Method == "DELETE"
-  contains(input.Path, "/containers/")
+allow if {
+	input.Method == "POST"
+	regex.match(`/containers/[^/]+/(start|stop|restart|kill|wait|rename)`, input.Path)
 }
 
-# 컨테이너 '생성'은 본문이 안전할 때만 허용 — 여기가 CVE 우회 지점이다.
-# privileged 도 아니고 호스트 루트('/') 바인드도 없을 때만 통과.
-# (Watchtower 의 /var/run/docker.sock, 앱의 firebase/localtime 마운트는 루트 바인드가
-#  아니므로 정상 통과한다. privileged 나 '/:' 바인드는 규칙 불충족 → 기본 거부로 차단.)
-allow {
-  input.Method == "POST"
-  contains(input.Path, "/containers/create")
-  not privileged
-  not host_root_bind
+allow if {
+	input.Method == "DELETE"
+	contains(input.Path, "/containers/")
 }
 
-privileged {
-  input.Body.HostConfig.Privileged == true
+allow if {
+	input.Method == "POST"
+	contains(input.Path, "/containers/create")
+	not dangerous_create
 }
 
-host_root_bind {
-  some b
-  startswith(input.Body.HostConfig.Binds[b], "/:")
+dangerous_create if { input.Body.HostConfig.Privileged == true }
+dangerous_create if { input.Body.HostConfig.CapAdd[_] }
+dangerous_create if { input.Body.HostConfig.PidMode == "host" }
+dangerous_create if { input.Body.HostConfig.NetworkMode == "host" }
+dangerous_create if { input.Body.HostConfig.IpcMode == "host" }
+dangerous_create if { startswith(input.Body.HostConfig.UsernsMode, "host") }
+dangerous_create if { input.Body.HostConfig.Devices[_] }
+dangerous_create if { input.Body.HostConfig.SecurityOpt[_] }
+
+dangerous_create if {
+	some bind in input.Body.HostConfig.Binds
+	not allowed_source(bind)
+}
+
+dangerous_create if {
+	some mnt in input.Body.HostConfig.Mounts
+	mnt.Type == "bind"
+	not allowed_source(mnt.Source)
+}
+
+allowed_source(src) if {
+	some p in ["/opt/app/", "/etc/localtime", "/var/run/docker.sock", "/root/.docker"]
+	startswith(src, p)
 }
 REGO
 

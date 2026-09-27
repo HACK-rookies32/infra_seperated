@@ -175,7 +175,6 @@ systemctl restart docker
 # ⚠️ 정책 경로/마운트는 플러그인 버전마다 다를 수 있다. 기본 마운트가 /etc/docker/authz 를
 #    못 집으면 `docker plugin set ${opa_authz_plugin} ...` 로 맞출 것(팀 몫. variables.tf 참고).
 # ==================================================================
-mkdir -p /etc/docker/authz
 
 # 베이스라인 정책: 기본 거부(default deny) + Watchtower CI/CD 수명주기만 allow.
 # fleet 안전(부팅 시 docker login·앱/Watchtower 컨테이너 생성·docker info)을 깨지 않으면서,
@@ -192,96 +191,71 @@ mkdir -p /etc/docker/authz
 #    자동 롤백된다(=AuthZ 해제). 아래 규칙은 이 세 가지를 모두 통과시킨다.
 # ⚠️ input.Method/Path/Body 스키마·경로는 플러그인 버전(${opa_authz_plugin})에 맞춰 팀이
 #    검증할 것. 어긋나면 규칙이 조용히 안 걸려(대개 fail-open) 통제가 무력화된다.
-cat > /etc/docker/authz/authz.rego <<'REGO'
+cat > /etc/docker/authz.rego <<'REGO'
 package docker.authz
 
-default allow = false
+import rego.v1
 
-# 상태 조회/검사/로그, 헬스체크(docker info·version·_ping), Watchtower 폴링 — 전부 GET.
-allow {
-  input.Method == "GET"
+default allow := false
+
+allow if {
+	input.Method == "GET"
 }
 
-# 레지스트리 로그인 (private 이미지 pull 전제)
-allow {
-  input.Method == "POST"
-  contains(input.Path, "/auth")
+allow if {
+	input.Method == "POST"
+	contains(input.Path, "/auth")
 }
 
-# 이미지 pull (Watchtower 갱신)
-allow {
-  input.Method == "POST"
-  contains(input.Path, "/images/create")
+allow if {
+	input.Method == "POST"
+	contains(input.Path, "/images/create")
 }
 
-# 이미지 정리 (WATCHTOWER_CLEANUP=true)
-allow {
-  input.Method == "DELETE"
-  contains(input.Path, "/images/")
+allow if {
+	input.Method == "DELETE"
+	contains(input.Path, "/images/")
 }
 
-# 기존 컨테이너 수명주기: 교체 시 stop→rename→start, watchdog 재기동, 제거 등.
-# id 로 지정된 '이미 존재하는' 컨테이너 대상 동작만. (exec 은 의도적으로 미포함=거부)
-allow {
-  input.Method == "POST"
-  regex.match(`/containers/[^/]+/(start|stop|restart|kill|wait|rename)`, input.Path)
-}
-allow {
-  input.Method == "DELETE"
-  contains(input.Path, "/containers/")
+allow if {
+	input.Method == "POST"
+	regex.match(`/containers/[^/]+/(start|stop|restart|kill|wait|rename)`, input.Path)
 }
 
-# 컨테이너 '생성' — 여기가 CVE-2026-34040 우회 지점이다(의도적으로 열어 둔다).
-#
-# 구조: "위험 패턴이 하나도 없으면 허용"(denylist). 정상 컨테이너가 절대 안 쓰는
-# 호스트 장악용 필드를 dangerous_create 로 열거하고, 바인드/마운트 소스는 이 fleet 이
-# 실제로 쓰는 경로만 allowed_source 허용목록으로 둔다. 목록 밖이면 위험 → 기본 거부.
-# (예전엔 privileged 와 '/:' 루트 바인드 두 가지만 봐서 나머지 escalation 경로 — 추가
-#  capability·호스트 네임스페이스·devices·임의 호스트 경로 바인드 — 가 전부 무방비였다.
-#  이제 진짜 본문을 보내는 평범한 남용은 아래 열거·허용목록이 다 잡는다.)
-#
-# ⚠️ CVE 시연 포인트(이 랩의 목적): 이 규칙은 본문을 '보고' 판정한다. 본문이 비어 있으면
-#    (Docker 29.3.0 이 1MB 초과 본문을 플러그인에 닿기 전에 버려 플러그인 눈엔 빈 본문)
-#    dangerous_create 의 어느 절도 참조 필드가 없어 걸리지 않는다 → not dangerous_create=true
-#    → 통과. 데몬은 그 뒤 실제(패딩된) 본문대로 privileged 컨테이너를 만든다 = 우회.
-#    이 통과를 '유일한 우회로'로 남기는 게 시연 목적이다. 닫으려면 이 allow 에 positive 게이트
-#    (예: known_image — 알려진 이미지일 때만 통과)를 한 줄 얹으면 빈 본문이 Image 부재로 탈락한다.
-allow {
-  input.Method == "POST"
-  contains(input.Path, "/containers/create")
-  not dangerous_create
+allow if {
+	input.Method == "DELETE"
+	contains(input.Path, "/containers/")
 }
 
-# 정상 컨테이너가 안 쓰는 구조 필드 = 있으면 무조건 위험.
-# (필드 부재 시 count/비교가 undefined 라 절이 안 걸린다 = 정상 컨테이너는 통과.)
-dangerous_create { input.Body.HostConfig.Privileged == true }
-dangerous_create { input.Body.HostConfig.CapAdd[_] }
-dangerous_create { input.Body.HostConfig.PidMode     == "host" }
-dangerous_create { input.Body.HostConfig.NetworkMode == "host" }
-dangerous_create { input.Body.HostConfig.IpcMode     == "host" }
-dangerous_create { startswith(input.Body.HostConfig.UsernsMode, "host") }
-dangerous_create { input.Body.HostConfig.Devices[_] }
-dangerous_create { input.Body.HostConfig.SecurityOpt[_] }
-
-# 바인드/마운트: 이 fleet 이 실제로 쓰는 소스만 허용, 그 밖이면 위험.
-#   /opt/app/...          앱 firebase.json 등
-#   /etc/localtime        타임존
-#   /var/run/docker.sock  Watchtower + (랩) 앱 컨테이너
-#   /root/.docker         Watchtower 레지스트리 자격
-dangerous_create {
-  some b
-  not allowed_source(input.Body.HostConfig.Binds[b])
-}
-dangerous_create {
-  some m
-  mnt := input.Body.HostConfig.Mounts[m]
-  mnt.Type == "bind"
-  not allowed_source(mnt.Source)
+allow if {
+	input.Method == "POST"
+	contains(input.Path, "/containers/create")
+	not dangerous_create
 }
 
-allowed_source(src) {
-  prefixes := ["/opt/app/", "/etc/localtime", "/var/run/docker.sock", "/root/.docker"]
-  startswith(src, prefixes[_])
+dangerous_create if { input.Body.HostConfig.Privileged == true }
+dangerous_create if { input.Body.HostConfig.CapAdd[_] }
+dangerous_create if { input.Body.HostConfig.PidMode == "host" }
+dangerous_create if { input.Body.HostConfig.NetworkMode == "host" }
+dangerous_create if { input.Body.HostConfig.IpcMode == "host" }
+dangerous_create if { startswith(input.Body.HostConfig.UsernsMode, "host") }
+dangerous_create if { input.Body.HostConfig.Devices[_] }
+dangerous_create if { input.Body.HostConfig.SecurityOpt[_] }
+
+dangerous_create if {
+	some bind in input.Body.HostConfig.Binds
+	not allowed_source(bind)
+}
+
+dangerous_create if {
+	some mnt in input.Body.HostConfig.Mounts
+	mnt.Type == "bind"
+	not allowed_source(mnt.Source)
+}
+
+allowed_source(src) if {
+	some p in ["/opt/app/", "/etc/localtime", "/var/run/docker.sock", "/root/.docker"]
+	startswith(src, p)
 }
 REGO
 
