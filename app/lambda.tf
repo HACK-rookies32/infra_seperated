@@ -87,14 +87,16 @@ resource "aws_lambda_function" "deploy_helper" {   # (예시) 라벨
 }
 
 
-resource "aws_iam_user" "ops_admin" {              # (예시) 라벨
-  count = local.ops_admin_count
-  name  = "kidhackapp-ops-admin"                    # (예시) 사용자명 — AWS에 찍히므로 자연스러운 이름 권장
+# studentAdmin 정책이 iam:DeleteUser 를 명시적 Deny 하므로 사용자는 destroy 불가.
+# 사용자는 계정에 상시 존재하는 것으로 보고 조회만 하고, 키·정책만 Terraform이 생성/삭제한다.
+data "aws_iam_user" "ops_admin" {                   # (예시) 라벨
+  count     = local.ops_admin_count
+  user_name = "kidhackapp-ops-admin"                # (예시) 사용자명 — AWS에 찍히므로 자연스러운 이름 권장
 }
 
 resource "aws_iam_access_key" "ops_admin" {
   count = local.ops_admin_count
-  user  = aws_iam_user.ops_admin[0].name
+  user  = data.aws_iam_user.ops_admin[0].user_name
 }
 
 resource "aws_ssm_parameter" "ops_admin" {
@@ -110,7 +112,7 @@ resource "aws_ssm_parameter" "ops_admin" {
 resource "aws_iam_user_policy" "ops_admin" {
   count = local.ops_admin_count
   name  = "kidhackapp-ops-admin-policy"             # (예시) 정책명
-  user  = aws_iam_user.ops_admin[0].name
+  user  = data.aws_iam_user.ops_admin[0].user_name
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [
