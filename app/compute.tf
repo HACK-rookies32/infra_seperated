@@ -45,6 +45,7 @@ locals {
     region                   = var.aws_region
     nlb_dns                  = aws_lb.int_nlb.dns_name
     dns_resolver             = local.vpc_dns
+    admin_host               = "${var.admin_subdomain}.${var.domain_name}"
     timezone                 = var.timezone
     dockerhub_image          = var.dockerhub_image
     dockerhub_username       = var.dockerhub_username

@@ -27,7 +27,7 @@ data "aws_route53_zone" "main" {
 resource "aws_acm_certificate" "cert" {
   count                     = local.dns_enabled
   domain_name               = var.domain_name
-  subject_alternative_names = ["www.${var.domain_name}"]
+  subject_alternative_names = ["*.${var.domain_name}"]
   validation_method         = "DNS"
 
   lifecycle {
@@ -35,25 +35,25 @@ resource "aws_acm_certificate" "cert" {
   }
 }
 
+# 와일드카드(*.domain)는 apex 와 같은 검증 CNAME 을 공유하므로, 수기 호스트명
+# 목록이 아니라 인증서의 domain_validation_options 를 domain_name 키로 순회한다.
+# 중복 레코드는 allow_overwrite 로 흡수된다.
 resource "aws_route53_record" "cert_validation" {
-  for_each = toset(local.cert_domains)
+  for_each = local.dns_enabled == 1 ? {
+    for dvo in aws_acm_certificate.cert[0].domain_validation_options : dvo.domain_name => {
+      name   = dvo.resource_record_name
+      type   = dvo.resource_record_type
+      record = dvo.resource_record_value
+    }
+  } : {}
 
   zone_id         = data.aws_route53_zone.main[0].zone_id
   allow_overwrite = true
   ttl             = 60
 
-  name = one([
-    for dvo in aws_acm_certificate.cert[0].domain_validation_options :
-    dvo.resource_record_name if dvo.domain_name == each.key
-  ])
-  type = one([
-    for dvo in aws_acm_certificate.cert[0].domain_validation_options :
-    dvo.resource_record_type if dvo.domain_name == each.key
-  ])
-  records = [one([
-    for dvo in aws_acm_certificate.cert[0].domain_validation_options :
-    dvo.resource_record_value if dvo.domain_name == each.key
-  ])]
+  name    = each.value.name
+  type    = each.value.type
+  records = [each.value.record]
 }
 
 resource "aws_acm_certificate_validation" "cert" {

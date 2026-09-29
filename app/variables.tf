@@ -27,6 +27,13 @@ variable "domain_name" {
   default = "kidhackapp.com"
 }
 
+# 관리자 콘솔 서브도메인 라벨. manage.<domain_name> 으로만 관리자 SPA 가 뜬다
+# (호스트 분기는 웹 이미지의 nginx 가 ADMIN_HOST env 로 한다).
+variable "admin_subdomain" {
+  type    = string
+  default = "manage"
+}
+
 # backend_prod_yml 렌더링·WAS user_data 에 쓰는 DB 좌표(값 아님, 이름/계정만).
 variable "oracle_db_name" {
   type    = string

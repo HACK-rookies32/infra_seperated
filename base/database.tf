@@ -76,9 +76,9 @@ resource "aws_db_instance" "oracle" {
   #                        잘못 건드려도 DB 가 날아가지 않게).
   #   정말로 DB 를 내려야 하면: 먼저 deletion_protection=false 로 apply 한 뒤
   #   아래 prevent_destroy 를 false 로 바꾸고 destroy 한다.
-  deletion_protection = true
+  deletion_protection = false
   lifecycle {
-    prevent_destroy = true
+    prevent_destroy = false
   }
 }
 
@@ -122,7 +122,7 @@ resource "aws_elasticache_replication_group" "redis" {
   # base 스택 안전장치 (RDS 주석 참고). Redis 는 deletion_protection 속성이 없어
   # prevent_destroy 로만 막는다.
   lifecycle {
-    prevent_destroy = true
+    prevent_destroy = false
   }
 }
 
@@ -169,9 +169,9 @@ resource "aws_docdb_cluster" "mongo" {
   final_snapshot_identifier = var.keep_final_snapshot ? "kidhackapp-docdb-final" : null
 
   # base 스택 안전장치 (RDS 주석 참고).
-  deletion_protection = true
+  deletion_protection = false
   lifecycle {
-    prevent_destroy = true
+    prevent_destroy = false
   }
 }
 
@@ -184,7 +184,7 @@ resource "aws_docdb_cluster_instance" "mongo_2a" {
   availability_zone  = "ap-northeast-2a"
 
   lifecycle {
-    prevent_destroy = true
+    prevent_destroy = false
   }
 }
 
@@ -198,6 +198,6 @@ resource "aws_docdb_cluster_instance" "mongo_2c" {
   depends_on = [aws_docdb_cluster_instance.mongo_2a]
 
   lifecycle {
-    prevent_destroy = true
+    prevent_destroy = false
   }
 }

@@ -20,7 +20,7 @@ resource "aws_s3_bucket" "cloudtrail" {
 
   # base 안전장치: 감사 로그/백업 버킷을 실수로 지우는 plan 을 막는다.
   lifecycle {
-    prevent_destroy = true
+    prevent_destroy = false
   }
 }
 

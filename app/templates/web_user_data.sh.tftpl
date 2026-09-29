@@ -358,6 +358,11 @@ fi
 #     VPC DNS 는 "VPC 대역 + 2" 에도 같은 서비스를 제공하고 이쪽은 일반
 #     라우팅되는 주소라 컨테이너에서도 닿는다. compute.tf 가 cidrhost 로 계산해 넘긴다.
 #
+# ADMIN_HOST 를 넘기는 이유:
+#   nginx 가 Host 헤더로 관리자 콘솔(manage.<domain>)과 기본 블록(API 전용)을
+#   분기한다. 이 값이 비면 server_name 이 빈 채로 렌더링되어 nginx 가 뜨지 않으므로
+#   반드시 "이 env 주입(app apply) → 이미지 교체" 순서로 배포한다.
+#
 # watchtower 라벨이 붙은 컨테이너만 갱신 대상이 된다.
 # ------------------------------------------------------------------
 # ⚠️ 컨테이너 시각과 타임존
@@ -398,6 +403,7 @@ ExecStart=/usr/bin/docker run -d \\
   -p 80:80 \\
   -e NLB_DNS=${nlb_dns} \\
   -e DNS_RESOLVER=${dns_resolver} \\
+  -e ADMIN_HOST=${admin_host} \\
   -e TZ=${timezone} \\
   -v /etc/localtime:/etc/localtime:ro \\
   -l com.centurylinklabs.watchtower.enable=true \\

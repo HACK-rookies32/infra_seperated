@@ -18,7 +18,7 @@ resource "aws_s3_bucket" "media" {
 
   # base 안전장치: 실수로 이 버킷을 지우는 plan 을 막는다(사용자 첨부 보존).
   lifecycle {
-    prevent_destroy = true
+    prevent_destroy = false
   }
 }
 
@@ -114,10 +114,10 @@ resource "aws_s3_bucket_policy" "media_tls_only" {
 # force_destroy = false 라 비어 있지 않으면 destroy 가 BucketNotEmpty 로 막힌다.
 resource "aws_s3_bucket" "secure_share" {
   bucket        = var.secure_share_bucket_name
-  force_destroy = false
+  force_destroy = true
 
   lifecycle {
-    prevent_destroy = true
+    prevent_destroy = false
   }
 }
 

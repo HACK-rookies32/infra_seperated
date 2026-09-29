@@ -8,6 +8,7 @@ locals {
   media_cors_origins = var.domain_name != "" ? [
     "https://${var.domain_name}",
     "https://www.${var.domain_name}",
+    "https://${var.admin_subdomain}.${var.domain_name}",
     ] : [
     "http://${aws_lb.ext_alb.dns_name}",
   ]

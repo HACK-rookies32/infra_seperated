@@ -1,14 +1,18 @@
 # ==========================================
 # 9. DNS (Route 53) — app 스택 (도메인 -> ALB Alias)
 # ==========================================
-# ACM 인증서 발급·검증은 base 가 끝내 둔다. 여기서는 도메인/ www 를 이번 app 의
+# ACM 인증서 발급·검증은 base 가 끝내 둔다(와일드카드 *.domain). 여기서는 도메인/ www / manage 를 이번 app 의
 # ALB 로 가리키는 Alias 레코드만 만든다. app destroy 시 이 레코드만 사라지고
 # 호스팅 존·인증서는 base 에 남는다.
+#
+# ⚠️ 와일드카드 DNS 레코드는 만들지 않는다. manage 는 실제 A(alias) 레코드로만
+# 존재해야 서브도메인 브루트포싱으로만 발견된다(인증서는 와일드카드라 CT 로그에 미노출).
 
 locals {
   cert_domains = var.domain_name != "" ? [
     var.domain_name,
     "www.${var.domain_name}",
+    "${var.admin_subdomain}.${var.domain_name}",
   ] : []
 }
 
