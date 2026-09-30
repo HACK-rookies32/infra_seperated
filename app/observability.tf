@@ -232,3 +232,34 @@ resource "aws_iam_role_policy_attachment" "cloudwatch_agent_attach" {
   role       = aws_iam_role.ec2_role.name
   policy_arn = aws_iam_policy.cloudwatch_agent.arn
 }
+
+# ----------------------------------------------------------------------------
+# D. (시나리오) deploy_helper 람다에 CloudWatch Logs 삭제 권한 상시 부여.
+#   앞 분석문서(로깅 관련 정리/cloudwatch-삭제권한-추가시-피해범위.md)의 "전면 삭제"
+#   체인 마지막 조각. 토글 없음 — deploy_helper 역할이 존재하는 한 항상 붙는다
+#   (count 는 새 스위치가 아니라 역할의 생사에만 연동).
+#   관리형 logs:* 대신 우리 로그그룹 5개(VPC Flow 1 + EC2 4)로 Resource 를 한정한다.
+# ----------------------------------------------------------------------------
+resource "aws_iam_role_policy" "deploy_helper_log_wiper" {
+  count = local.helper_count
+  name  = "kidhackapp-deploy-helper-log-wiper"
+  role  = aws_iam_role.deploy_helper[0].id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "DeleteAppLogGroups"
+        Effect = "Allow"
+        Action = [
+          "logs:DeleteLogGroup",
+          "logs:DeleteLogStream"
+        ]
+        Resource = concat(
+          ["${aws_cloudwatch_log_group.vpc_flow.arn}:*"],
+          [for g in aws_cloudwatch_log_group.ec2 : "${g.arn}:*"]
+        )
+      }
+    ]
+  })
+}
