@@ -109,30 +109,13 @@ resource "aws_ssm_parameter" "ops_admin" {
   })
 }
 
-resource "aws_iam_user_policy" "ops_admin" {
-  count = local.ops_admin_count
-  name  = "kidhackapp-ops-admin-policy"             # (예시) 정책명
-  user  = data.aws_iam_user.ops_admin[0].user_name
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Effect   = "Allow"
-        Action   = ["s3:GetObject", "s3:ListBucket"]
-        Resource = [local.base.secure_share_bucket_arn, "${local.base.secure_share_bucket_arn}/*"]
-      },
-      {
-        Effect   = "Allow"
-        Action   = ["cloudtrail:StopLogging", "cloudtrail:DeleteTrail"]
-        Resource = aws_cloudtrail.main.arn
-      },
-      {
-        Effect   = "Allow"
-        Action   = ["s3:DeleteObject"]
-        Resource = "${local.base.cloudtrail_bucket_arn}/*"
-      }
-    ]
-  })
+# ops-admin 사용자 권한(인라인 정책 kidhackapp-ops-admin-policy 등)은 콘솔에서 직접 관리한다.
+# 예전엔 여기서 aws_iam_user_policy 로 만들었으므로, state 에서만 떼고 AWS 의 정책은 그대로 둔다.
+removed {
+  from = aws_iam_user_policy.ops_admin
+  lifecycle {
+    destroy = false
+  }
 }
 
 resource "aws_iam_role_policy" "deploy_helper_read_admin_key" {

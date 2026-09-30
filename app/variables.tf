@@ -121,13 +121,13 @@ variable "enable_cloudwatch_agent" {
 variable "enable_member_backup" {
   description = "member 월간 백업 Lambda 생성 토글. false 면 아무것도 생성하지 않음."
   type        = bool
-  default     = false
+  default     = true
 }
 
 variable "member_backup_zip_path" {
-  description = "백업 Lambda 핸들러 zip 경로(팀 제공). enable_member_backup=true 면 필수."
+  description = "백업 Lambda 핸들러 zip 경로. member_backup/build.sh 로 생성. enable_member_backup=true 면 필수."
   type        = string
-  default     = ""
+  default     = "./member_backup.zip"
 }
 
 variable "member_backup_handler" {
