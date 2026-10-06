@@ -93,16 +93,43 @@ terraform destroy      # DB 는 건드리지 않는다. 다음엔 apply 만 다�
 
 ---
 
-## base 를 정말 내려야 할 때 (안전장치 해제)
+## base 를 내리고 다시 복원하기 (DB 스냅샷)
 
-base 의 DB·버킷에는 3중 안전장치가 걸려 있다: `deletion_protection = true`,
-`lifecycle { prevent_destroy = true }`, RDS/DocDB 최종 스냅샷(`keep_final_snapshot`).
-평소 destroy 를 막기 위한 것이므로, 정말 내리려면:
+Oracle / DocDB 만 final 스냅샷을 남긴다(`keep_final_snapshot`, 기본 `true`).
+Redis 는 세션 캐시라 남기지 않는다. `deletion_protection`·`prevent_destroy` 를 켜 둔
+상태라면 먼저 `false` 로 바꾸고 apply 할 것.
 
-1. database.tf 에서 각 DB 의 `deletion_protection = false` 로 바꾸고 `terraform apply`
-2. database.tf / storage.tf / observability.tf 의 `prevent_destroy = true` → `false`
-3. 데이터를 남기려면 `$env:TF_VAR_keep_final_snapshot = 'true'`
-4. `terraform destroy`
+### 내리기
+
+```powershell
+cd base
+terraform apply                     # 설정 변경 후 최소 1회 — destroy 는 state 값을 쓴다
+.\scripts\destroy-keep-db.ps1       # 그냥 terraform destroy 하지 말 것
+```
+
+스크립트가 하는 일: final 스냅샷 설정 확인 → 카드키를 `/kidhackapp/backup/card-storage-key`
+(Terraform 밖 SSM)로 복사 → Oracle 옵션그룹을 state 에서 분리(스냅샷이 붙잡고 있어
+삭제 불가) → `terraform destroy`. 취소·실패하면 옵션그룹을 다시 import 해 둔다.
+
+destroy 후 AWS 에 남는 것: `kidhackapp-oracle-db-final-<hex>`, `kidhackapp-docdb-final-<hex>`
+스냅샷, `kidhackapp-oracle-options` 옵션그룹, 백업 키 파라미터.
+
+### 복원
+
+```powershell
+$env:TF_VAR_restore_from_snapshot = 'true'
+terraform apply
+```
+
+- 각 DB 의 **가장 최근 수동 스냅샷**에서 만든다. 스냅샷·백업 키가 없으면 plan 에서 실패한다.
+- 옵션그룹은 `import` 블록이 자동으로 state 에 다시 넣는다.
+- 카드키는 백업 파라미터 값을 쓴다 → 복원된 카드 데이터 복호 가능. `jwt_secret` 은 새로
+  만들어지므로 기존 로그인 토큰은 무효(재로그인).
+- 엔드포인트는 식별자 기반이라 그대로다. app 은 평소처럼 apply 하면 된다.
+- 복원 뒤 `restore_from_snapshot` 은 그대로 둬도, 끄더라도 DB·카드키가 다시 바뀌지 않는다
+  (`ignore_changes`).
+- 다 쓴 옛 스냅샷은 비용(스토리지)이 나가니 직접 지울 것. 단 Oracle 스냅샷이 하나라도
+  남아 있으면 옵션그룹은 지울 수 없다.
 
 ---
 
