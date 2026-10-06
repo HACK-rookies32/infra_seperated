@@ -62,12 +62,28 @@ variable "db_password" {
   sensitive = true
 }
 
-# destroy 시 최종 스냅샷을 남길지 여부.
-# base 를 destroy 할 일은 거의 없지만, DB 리소스에 prevent_destroy 도 함께
-# 걸려 있어(database.tf) 실수로 지워지지 않는다.
+# destroy 시 Oracle/DocDB 최종 스냅샷을 남길지 여부 (Redis 는 항상 안 남김).
+# ⚠️ destroy 는 state 에 기록된 값으로 동작한다. 이 값을 바꿨다면 destroy 전에
+#    반드시 한 번 apply 해야 한다 — 안 그러면 바꾸기 전 값으로 지워진다.
 variable "keep_final_snapshot" {
   type    = bool
+  default = true
+}
+
+# true 면 Oracle/DocDB 를 가장 최근 수동(final) 스냅샷에서 복원하고,
+# card_storage_key 를 백업 파라미터(card_storage_key_backup_param)에서 가져온다.
+#   $env:TF_VAR_restore_from_snapshot = 'true'
+# 스냅샷이나 백업 키가 없으면 plan 단계에서 실패한다.
+variable "restore_from_snapshot" {
+  type    = bool
   default = false
+}
+
+# destroy 스크립트가 카드키를 복사해 두는 SSM 파라미터. Terraform 이 관리하지 않으므로
+# base destroy 에도 남는다.
+variable "card_storage_key_backup_param" {
+  type    = string
+  default = "/kidhackapp/backup/card-storage-key"
 }
 
 variable "oracle_db_name" {

@@ -114,9 +114,23 @@ resource "random_bytes" "card_storage_key" {
 #
 # ⚠️ value 는 random_bytes 의 Base64 표현이다. FieldEncryptionKey 가
 #    Base64 로 디코드해 32 바이트인지 검증하므로 .hex 가 아니라 .base64 여야 한다.
+#
+# 스냅샷 복원(restore_from_snapshot=true) 시에는 스냅샷 속 카드가 옛 키로 암호화돼
+# 있으므로, random_bytes 가 아니라 destroy 스크립트가 남긴 백업 키를 쓴다.
+# 그 뒤 restore_from_snapshot 을 false 로 돌려도 키가 random 값으로 바뀌지 않도록
+# value 변경은 무시한다(이 키는 원래 절대 바뀌면 안 되는 값이다).
+data "aws_ssm_parameter" "card_storage_key_backup" {
+  count = var.restore_from_snapshot ? 1 : 0
+  name  = var.card_storage_key_backup_param
+}
+
 resource "aws_ssm_parameter" "card_storage_key" {
   name        = "/kidhackapp/app/card-storage-key"
   description = "Card field-encryption AES-256 key (Base64 32B) for kidhack-backend"
   type        = "SecureString"
-  value       = random_bytes.card_storage_key.base64
+  value       = var.restore_from_snapshot ? data.aws_ssm_parameter.card_storage_key_backup[0].value : random_bytes.card_storage_key.base64
+
+  lifecycle {
+    ignore_changes = [value]
+  }
 }

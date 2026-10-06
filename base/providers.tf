@@ -1,5 +1,6 @@
 terraform {
-  required_version = ">= 1.5.0"
+  # 1.7+: database.tf 의 조건부 import 블록(for_each) 때문.
+  required_version = ">= 1.7.0"
   required_providers {
     aws = {
       source  = "hashicorp/aws"

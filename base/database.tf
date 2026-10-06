@@ -32,6 +32,45 @@ resource "aws_db_option_group" "oracle" {
   }
 }
 
+# ------------------------------------------------------------------
+# 스냅샷 보존 / 복원 (Oracle, DocDB 만. Redis 는 세션 캐시라 제외)
+# ------------------------------------------------------------------
+# destroy: keep_final_snapshot=true 면 final 스냅샷을 남긴다.
+#          base/scripts/destroy-keep-db.ps1 로 내릴 것 (옵션그룹·카드키 처리 포함).
+# 복원   : restore_from_snapshot=true 로 apply 하면 각 DB 의 가장 최근 수동
+#          스냅샷에서 만든다. final 스냅샷은 수동(manual) 유형이다.
+
+# final 스냅샷 이름 접미사. base 수명주기마다 새로 생겨 이름 충돌을 막는다.
+resource "random_id" "final_snapshot_suffix" {
+  byte_length = 4
+}
+
+# 인스턴스가 지워진 뒤에도 스냅샷은 원래 식별자로 조회된다.
+# 스냅샷이 하나도 없으면 여기서 plan 이 실패한다(조용히 빈 DB 로 뜨지 않게).
+data "aws_db_snapshot" "oracle_latest" {
+  count                  = var.restore_from_snapshot ? 1 : 0
+  db_instance_identifier = "kidhackapp-oracle-db"
+  snapshot_type          = "manual"
+  most_recent            = true
+}
+
+# DocumentDB 는 RDS API 를 공유하므로 aws_db_cluster_snapshot 으로 조회된다.
+data "aws_db_cluster_snapshot" "docdb_latest" {
+  count                 = var.restore_from_snapshot ? 1 : 0
+  db_cluster_identifier = "kidhackapp-docdb-cluster"
+  snapshot_type         = "manual"
+  most_recent           = true
+}
+
+# Oracle 스냅샷은 옵션그룹을 붙잡고 있어서, 스냅샷이 남아 있는 한 옵션그룹은
+# 삭제되지 않는다(InvalidOptionGroupStateFault). 그래서 destroy 스크립트가 옵션그룹을
+# state 에서 빼 AWS 에 남겨 두고, 복원할 때 여기서 다시 state 로 가져온다.
+import {
+  for_each = var.restore_from_snapshot ? toset(["kidhackapp-oracle-options"]) : toset([])
+  to       = aws_db_option_group.oracle
+  id       = each.value
+}
+
 # RDS Oracle Instance (Multi-AZ: primary 2a / standby 2c)
 resource "aws_db_instance" "oracle" {
   identifier = "kidhackapp-oracle-db"
@@ -66,8 +105,14 @@ resource "aws_db_instance" "oracle" {
   copy_tags_to_snapshot   = true
 
   # 최종 스냅샷 여부는 var.keep_final_snapshot 로 제어한다 (variables.tf 주석 참고).
+  # 이름에 수명주기별 접미사를 붙인다. 고정 이름이면 스냅샷으로 복원한 뒤 다시
+  # destroy 할 때 이전 final 스냅샷과 이름이 겹쳐 DBSnapshotAlreadyExists 로 실패한다.
   skip_final_snapshot       = !var.keep_final_snapshot
-  final_snapshot_identifier = var.keep_final_snapshot ? "kidhackapp-oracle-db-final" : null
+  final_snapshot_identifier = var.keep_final_snapshot ? "kidhackapp-oracle-db-final-${random_id.final_snapshot_suffix.hex}" : null
+
+  # 복원 모드면 가장 최근 수동(=final) 스냅샷에서 만든다. 비밀번호·Multi-AZ·백업
+  # 설정은 복원 직후 provider 가 modify 로 다시 맞춘다.
+  snapshot_identifier = var.restore_from_snapshot ? data.aws_db_snapshot.oracle_latest[0].db_snapshot_identifier : null
 
   # ⚠️ base 스택 안전장치 — 데이터 보존.
   #   deletion_protection = true 이면 terraform destroy / 콘솔 삭제가 거부된다.
@@ -79,6 +124,9 @@ resource "aws_db_instance" "oracle" {
   deletion_protection = false
   lifecycle {
     prevent_destroy = false
+    # snapshot_identifier 는 ForceNew 다. 복원 후 더 새 수동 스냅샷이 생기거나
+    # restore_from_snapshot 을 false 로 되돌려도 DB 를 재생성하지 않도록 무시한다.
+    ignore_changes = [snapshot_identifier]
   }
 }
 
@@ -111,13 +159,12 @@ resource "aws_elasticache_replication_group" "redis" {
   at_rest_encryption_enabled = true
   transit_encryption_enabled = true
 
-  # 일 단위 스냅샷. destroy 시 최종 스냅샷은 var.keep_final_snapshot=true 일 때만
-  # 남긴다(기본 false → 미생성). 정기 스냅샷은 snapshot_retention_limit(5)로 별도 유지.
+  # 일 단위 스냅샷(snapshot_retention_limit=5)만 유지한다. Redis 는 세션 캐시라
+  # destroy 시 최종 스냅샷을 남기지 않는다 — 복원 대상은 Oracle/DocDB 뿐이다.
   # snapshot_window 는 maintenance_window 와 겹치면 안 됨 (UTC 기준).
-  snapshot_retention_limit  = 5
-  snapshot_window           = "19:00-20:00"         # KST 04:00-05:00
-  maintenance_window        = "sun:20:30-sun:21:30" # KST 일 05:30-06:30
-  final_snapshot_identifier = var.keep_final_snapshot ? "kidhackapp-redis-final" : null
+  snapshot_retention_limit = 5
+  snapshot_window          = "19:00-20:00"         # KST 04:00-05:00
+  maintenance_window       = "sun:20:30-sun:21:30" # KST 일 05:30-06:30
 
   # base 스택 안전장치 (RDS 주석 참고). Redis 는 deletion_protection 속성이 없어
   # prevent_destroy 로만 막는다.
@@ -166,12 +213,15 @@ resource "aws_docdb_cluster" "mongo" {
   preferred_maintenance_window = "sun:19:30-sun:20:30" # KST 일 04:30-05:30
 
   skip_final_snapshot       = !var.keep_final_snapshot
-  final_snapshot_identifier = var.keep_final_snapshot ? "kidhackapp-docdb-final" : null
+  final_snapshot_identifier = var.keep_final_snapshot ? "kidhackapp-docdb-final-${random_id.final_snapshot_suffix.hex}" : null
+
+  snapshot_identifier = var.restore_from_snapshot ? data.aws_db_cluster_snapshot.docdb_latest[0].id : null
 
   # base 스택 안전장치 (RDS 주석 참고).
   deletion_protection = false
   lifecycle {
     prevent_destroy = false
+    ignore_changes  = [snapshot_identifier]
   }
 }
 
